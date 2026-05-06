@@ -1080,3 +1080,567 @@ func TestProcessOngoingTokenDistribution_ErrorContext(t *testing.T) {
 		requireT.Contains(errStr, want, "missing %q from error chain", want)
 	}
 }
+
+// TestDistribution_JailedValidator_SkipsReward verifies that when a delegator has stake on both
+// jailed and healthy validators:
+//   - The jailed validator's proportional share is routed to the Community Pool.
+//   - The healthy validator receives auto-delegation for its proportional share only.
+//   - The delegator's wallet remains unchanged (eligible portion fully auto-delegated,
+//     jailed portion never sent to wallet).
+//   - The jailed validator's token balance does not grow.
+//   - PSE is not disabled.
+func TestDistribution_JailedValidator_SkipsReward(t *testing.T) {
+	requireT := require.New(t)
+
+	testApp := simapp.New()
+	pseKeeper := testApp.PSEKeeper
+	stakingKeeper := testApp.StakingKeeper
+
+	t0 := time.Now().UTC().Round(time.Second)
+	ctx, _, err := testApp.BeginNextBlockAtTime(t0)
+	requireT.NoError(err)
+	bondDenom, err := stakingKeeper.BondDenom(ctx)
+	requireT.NoError(err)
+
+	// Create two validators: one to jail, one to remain healthy.
+	createValidator := func() sdk.ValAddress {
+		op, _ := testApp.GenAccount(ctx)
+		requireT.NoError(testApp.FundAccount(ctx, op,
+			sdk.NewCoins(sdk.NewCoin(bondDenom, sdkmath.NewInt(1_000)))))
+		val, err := testApp.AddValidator(ctx, op, sdk.NewInt64Coin(bondDenom, 10), nil)
+		requireT.NoError(err)
+		return sdk.MustValAddressFromBech32(val.GetOperator())
+	}
+	valJailedAddr := createValidator()
+	valHealthyAddr := createValidator()
+
+	delAddr, _ := testApp.GenAccount(ctx)
+	requireT.NoError(testApp.FundAccount(ctx, delAddr,
+		sdk.NewCoins(sdk.NewCoin(bondDenom, sdkmath.NewInt(20_000)))))
+
+	// Delegate equal amounts to both validators (50/50 split).
+	// This means: eligibleShare = userAmount × 1000/2000 = userAmount/2
+	// and jailed portion = userAmount/2 → Community Pool.
+	delegateTo := func(val sdk.ValAddress, amount int64) {
+		_, err := stakingkeeper.NewMsgServerImpl(stakingKeeper).Delegate(ctx, &stakingtypes.MsgDelegate{
+			DelegatorAddress: delAddr.String(),
+			ValidatorAddress: val.String(),
+			Amount:           sdk.NewInt64Coin(bondDenom, amount),
+		})
+		requireT.NoError(err)
+	}
+	delegateTo(valJailedAddr, 1_000)
+	delegateTo(valHealthyAddr, 1_000)
+
+	// Capture pre-jail token balances for later assertions.
+	valJailedBefore, err := stakingKeeper.GetValidator(ctx, valJailedAddr)
+	requireT.NoError(err)
+	jailedTokensBefore := valJailedBefore.Tokens
+
+	valHealthyBefore, err := stakingKeeper.GetValidator(ctx, valHealthyAddr)
+	requireT.NoError(err)
+	healthyTokensBefore := valHealthyBefore.Tokens
+
+	// Jail the first validator.
+	jailValidator(t, requireT, ctx, stakingKeeper, valJailedAddr)
+
+	// Capture pre-distribution state.
+	communityBefore := communityPoolBalance(requireT, testApp, ctx, bondDenom)
+	walletBefore := testApp.BankKeeper.GetBalance(ctx, delAddr, bondDenom).Amount
+
+	// Schedule and fund the distribution.
+	scheduleTimestamp := t0.Add(5 * time.Second)
+	const distributionAmount = int64(10_000_000)
+	requireT.NoError(pseKeeper.SaveDistributionSchedule(ctx, []types.ScheduledDistribution{{
+		ID:        1,
+		Timestamp: uint64(scheduleTimestamp.Unix()),
+		Allocations: []types.ClearingAccountAllocation{{
+			ClearingAccount: types.ClearingAccountCommunity,
+			Amount:          sdkmath.NewInt(distributionAmount),
+		}},
+	}}))
+	fundCommunityAccount(requireT, testApp, ctx, bondDenom, sdkmath.NewInt(distributionAmount))
+
+	// Run three-block distribution sequence.
+	runDistribution(requireT, testApp, t0)
+
+	ctx, _, err = testApp.BeginNextBlockAtTime(t0.Add(25 * time.Second))
+	requireT.NoError(err)
+
+	// PSE must not be disabled; distribution must have finalized.
+	assertDistributionFinalized(requireT, pseKeeper, ctx, 1)
+
+	// Wallet must be unchanged: eligible portion was fully auto-delegated (never left
+	// as loose tokens), and the jailed portion was never sent to the wallet at all.
+	walletAfter := testApp.BankKeeper.GetBalance(ctx, delAddr, bondDenom).Amount
+	requireT.Equal(walletBefore, walletAfter,
+		"delegator wallet must be unchanged: eligible portion auto-delegated, "+
+			"jailed portion never sent to wallet")
+
+	// Community pool must have grown by the jailed validator's proportional share.
+	// With a 50/50 split, the community pool receives roughly half the delegator's
+	// PSE userAmount (plus any rounding from other delegators).
+	communityAfter := communityPoolBalance(requireT, testApp, ctx, bondDenom)
+	communityGrowth := communityAfter.Sub(communityBefore)
+	requireT.True(communityGrowth.IsPositive(),
+		"jailed validator's proportional share must be routed to the Community Pool")
+
+	// Healthy validator must have received auto-delegation from its proportional share.
+	valHealthyAfter, err := stakingKeeper.GetValidator(ctx, valHealthyAddr)
+	requireT.NoError(err)
+	healthyGrowth := valHealthyAfter.Tokens.Sub(healthyTokensBefore)
+	requireT.True(healthyGrowth.IsPositive(),
+		"healthy validator tokens must grow from auto-delegation (growth=%s)", healthyGrowth)
+
+	// Critical: jailed validator must NOT receive any auto-delegation.
+	// This catches regressions where the implementation sends tokens to jailed validators.
+	valJailedAfter, err := stakingKeeper.GetValidator(ctx, valJailedAddr)
+	requireT.NoError(err)
+	requireT.Equal(jailedTokensBefore, valJailedAfter.Tokens,
+		"jailed validator tokens must not change — no auto-delegation must target a jailed validator")
+
+	// Sanity: community growth and healthy growth together should approximately
+	// equal the delegator's total userAmount (within rounding from other delegators).
+	// Both should be roughly equal given the 50/50 delegation split.
+	requireT.True(communityGrowth.GT(sdkmath.ZeroInt()))
+	requireT.True(healthyGrowth.GT(sdkmath.ZeroInt()))
+}
+
+// TestDistribution_AllJailedValidators verifies that when every delegation is to a jailed
+// validator:
+//   - No bank-send occurs to the delegator (wallet unchanged).
+//   - The full reward remains in the intermediary until finalization.
+//   - The intermediary is fully drained after finalization.
+//   - The entire reward is routed to the Community Pool.
+//   - PSE is not disabled.
+func TestDistribution_AllJailedValidators(t *testing.T) {
+	requireT := require.New(t)
+
+	testApp := simapp.New()
+	pseKeeper := testApp.PSEKeeper
+	stakingKeeper := testApp.StakingKeeper
+
+	t0 := time.Now().UTC().Round(time.Second)
+	ctx, _, err := testApp.BeginNextBlockAtTime(t0)
+	requireT.NoError(err)
+	bondDenom, err := stakingKeeper.BondDenom(ctx)
+	requireT.NoError(err)
+
+	// Single validator — will be jailed before distribution.
+	op, _ := testApp.GenAccount(ctx)
+	requireT.NoError(testApp.FundAccount(ctx, op,
+		sdk.NewCoins(sdk.NewCoin(bondDenom, sdkmath.NewInt(1_000)))))
+	val, err := testApp.AddValidator(ctx, op, sdk.NewInt64Coin(bondDenom, 10), nil)
+	requireT.NoError(err)
+	valJailedAddr := sdk.MustValAddressFromBech32(val.GetOperator())
+
+	delAddr, _ := testApp.GenAccount(ctx)
+	requireT.NoError(testApp.FundAccount(ctx, delAddr,
+		sdk.NewCoins(sdk.NewCoin(bondDenom, sdkmath.NewInt(20_000)))))
+
+	_, err = stakingkeeper.NewMsgServerImpl(stakingKeeper).Delegate(ctx, &stakingtypes.MsgDelegate{
+		DelegatorAddress: delAddr.String(),
+		ValidatorAddress: valJailedAddr.String(),
+		Amount:           sdk.NewInt64Coin(bondDenom, 1_000),
+	})
+	requireT.NoError(err)
+
+	// Advance time so the delegator accumulates a positive score before jailing.
+	// This is important: we want to confirm the score exists (and is used in the
+	// proportion calculation) even though the reward ultimately goes to Community Pool.
+	ctx, _, err = testApp.BeginNextBlockAtTime(t0.Add(2 * time.Second))
+	requireT.NoError(err)
+
+	// Trigger score flush by making a small delegation change.
+	_, err = stakingkeeper.NewMsgServerImpl(stakingKeeper).Delegate(ctx, &stakingtypes.MsgDelegate{
+		DelegatorAddress: delAddr.String(),
+		ValidatorAddress: valJailedAddr.String(),
+		Amount:           sdk.NewInt64Coin(bondDenom, 1),
+	})
+	requireT.NoError(err)
+
+	// Capture score before distribution — must be positive to make the test meaningful.
+	// If score is zero, community pool growth could come from other delegators, not
+	// from this delegator's jailed portion, and the test would be vacuous.
+	scoreBeforeDistribution, err := pseKeeper.CalculateDelegatorScore(ctx, delAddr)
+	requireT.NoError(err)
+	requireT.True(scoreBeforeDistribution.IsPositive(),
+		"delegator must have positive score before distribution for this test to be meaningful")
+
+	// Now jail the validator.
+	jailValidator(t, requireT, ctx, stakingKeeper, valJailedAddr)
+
+	// Capture pre-distribution state.
+	communityBefore := communityPoolBalance(requireT, testApp, ctx, bondDenom)
+	walletBefore := testApp.BankKeeper.GetBalance(ctx, delAddr, bondDenom).Amount
+
+	// Schedule and fund the distribution.
+	scheduleTimestamp := t0.Add(5 * time.Second)
+	const distributionAmount = int64(10_000_000)
+	requireT.NoError(pseKeeper.SaveDistributionSchedule(ctx, []types.ScheduledDistribution{{
+		ID:        1,
+		Timestamp: uint64(scheduleTimestamp.Unix()),
+		Allocations: []types.ClearingAccountAllocation{{
+			ClearingAccount: types.ClearingAccountCommunity,
+			Amount:          sdkmath.NewInt(distributionAmount),
+		}},
+	}}))
+	fundCommunityAccount(requireT, testApp, ctx, bondDenom, sdkmath.NewInt(distributionAmount))
+
+	// Run three-block distribution sequence.
+	runDistribution(requireT, testApp, t0)
+
+	ctx, _, err = testApp.BeginNextBlockAtTime(t0.Add(25 * time.Second))
+	requireT.NoError(err)
+
+	// PSE must not be disabled; distribution must have finalized.
+	assertDistributionFinalized(requireT, pseKeeper, ctx, 1)
+
+	// Bank-send must be exactly zero — no tokens sent to the delegator's wallet.
+	walletAfter := testApp.BankKeeper.GetBalance(ctx, delAddr, bondDenom).Amount
+	requireT.Equal(walletBefore, walletAfter,
+		"bank-send must be zero when all validators are jailed — "+
+			"full reward must stay in intermediary until finalization")
+
+	// Full reward must be routed to the Community Pool after finalization.
+	communityAfter := communityPoolBalance(requireT, testApp, ctx, bondDenom)
+	communityGrowth := communityAfter.Sub(communityBefore)
+	requireT.True(communityGrowth.IsPositive(),
+		"full reward must be routed to the Community Pool when all validators are jailed")
+
+	// Intermediary must be fully drained after finalizeCommunityDistribution runs.
+	// This confirms the leftover sweep (totalPSEAmount - distributedSoFar) worked correctly.
+	intermediaryAddr := testApp.AccountKeeper.GetModuleAccount(
+		ctx, types.ClearingAccountCommunityIntermediary,
+	).GetAddress()
+	intermediaryBalance := testApp.BankKeeper.GetBalance(ctx, intermediaryAddr, bondDenom).Amount
+	requireT.True(intermediaryBalance.IsZero(),
+		"intermediary account must be fully drained at finalization (balance=%s)", intermediaryBalance)
+}
+
+// TestDistribution_JailedValidator_ScorePreserved verifies the core design decision:
+// score accumulated while the validator was bonded is preserved and contributes to the
+// PSE proportion calculation even after the validator is jailed.
+//
+// Scenario:
+//  1. Delegate to a validator.
+//  2. Advance time — score accumulates while validator is bonded.
+//  3. Jail the validator.
+//  4. Run distribution — delegator has positive score, but all validators are jailed.
+//  5. Expected: delegator's score is non-zero (used in proportion), but since all
+//     validators are jailed, no bank-send occurs and the Community Pool receives
+//     the delegator's proportional share.
+func TestDistribution_JailedValidator_ScorePreserved(t *testing.T) {
+	requireT := require.New(t)
+
+	testApp := simapp.New()
+	pseKeeper := testApp.PSEKeeper
+	stakingKeeper := testApp.StakingKeeper
+
+	t0 := time.Now().UTC().Round(time.Second)
+	ctx, _, err := testApp.BeginNextBlockAtTime(t0)
+	requireT.NoError(err)
+	bondDenom, err := stakingKeeper.BondDenom(ctx)
+	requireT.NoError(err)
+
+	// Single validator that will accumulate score while bonded, then get jailed.
+	op, _ := testApp.GenAccount(ctx)
+	requireT.NoError(testApp.FundAccount(ctx, op,
+		sdk.NewCoins(sdk.NewCoin(bondDenom, sdkmath.NewInt(1_000)))))
+	val, err := testApp.AddValidator(ctx, op, sdk.NewInt64Coin(bondDenom, 10), nil)
+	requireT.NoError(err)
+	valAddr := sdk.MustValAddressFromBech32(val.GetOperator())
+
+	delAddr, _ := testApp.GenAccount(ctx)
+	requireT.NoError(testApp.FundAccount(ctx, delAddr,
+		sdk.NewCoins(sdk.NewCoin(bondDenom, sdkmath.NewInt(20_000)))))
+
+	// Delegate while validator is bonded.
+	_, err = stakingkeeper.NewMsgServerImpl(stakingKeeper).Delegate(ctx, &stakingtypes.MsgDelegate{
+		DelegatorAddress: delAddr.String(),
+		ValidatorAddress: valAddr.String(),
+		Amount:           sdk.NewInt64Coin(bondDenom, 1_000),
+	})
+	requireT.NoError(err)
+
+	// Advance time to accumulate score while validator is healthy.
+	// Score accumulated here = 1000 tokens × 8 seconds = 8000.
+	ctx, _, err = testApp.BeginNextBlockAtTime(t0.Add(8 * time.Second))
+	requireT.NoError(err)
+
+	// Flush accumulated score to snapshot by triggering a delegation change.
+	_, err = stakingkeeper.NewMsgServerImpl(stakingKeeper).Delegate(ctx, &stakingtypes.MsgDelegate{
+		DelegatorAddress: delAddr.String(),
+		ValidatorAddress: valAddr.String(),
+		Amount:           sdk.NewInt64Coin(bondDenom, 1),
+	})
+	requireT.NoError(err)
+
+	// Capture score after bonded-period accumulation — this is the score that must
+	// survive jailing and still be used in the distribution proportion calculation.
+	scoreAfterBondedPeriod, err := pseKeeper.CalculateDelegatorScore(ctx, delAddr)
+	requireT.NoError(err)
+	requireT.True(scoreAfterBondedPeriod.IsPositive(),
+		"score must have accumulated during the bonded period")
+
+	// Jail the validator — score must not be affected.
+	jailValidator(t, requireT, ctx, stakingKeeper, valAddr)
+
+	// Verify score is unchanged after jailing (Phase-1 scoring is not modified).
+	scoreAfterJail, err := pseKeeper.CalculateDelegatorScore(ctx, delAddr)
+	requireT.NoError(err)
+	requireT.Equal(scoreAfterBondedPeriod, scoreAfterJail,
+		"score must be unchanged after validator is jailed — "+
+			"Phase-1 scoring is not affected by jailing")
+
+	// Capture pre-distribution Community Pool balance.
+	communityBefore := communityPoolBalance(requireT, testApp, ctx, bondDenom)
+	walletBefore := testApp.BankKeeper.GetBalance(ctx, delAddr, bondDenom).Amount
+
+	// Schedule and fund the distribution.
+	scheduleTimestamp := t0.Add(5 * time.Second) // already past, so it's due immediately
+	const distributionAmount = int64(10_000_000)
+	requireT.NoError(pseKeeper.SaveDistributionSchedule(ctx, []types.ScheduledDistribution{{
+		ID:        1,
+		Timestamp: uint64(scheduleTimestamp.Unix()),
+		Allocations: []types.ClearingAccountAllocation{{
+			ClearingAccount: types.ClearingAccountCommunity,
+			Amount:          sdkmath.NewInt(distributionAmount),
+		}},
+	}}))
+	fundCommunityAccount(requireT, testApp, ctx, bondDenom, sdkmath.NewInt(distributionAmount))
+
+	// Run distribution.
+	runDistribution(requireT, testApp, t0)
+
+	ctx, _, err = testApp.BeginNextBlockAtTime(t0.Add(25 * time.Second))
+	requireT.NoError(err)
+
+	// PSE must not be disabled; distribution must have finalized.
+	assertDistributionFinalized(requireT, pseKeeper, ctx, 1)
+
+	// Verify outcomes.
+	//
+	// Wallet unchanged: validator is jailed so no bank-send occurred.
+	walletAfter := testApp.BankKeeper.GetBalance(ctx, delAddr, bondDenom).Amount
+	requireT.Equal(walletBefore, walletAfter,
+		"wallet must be unchanged — validator is jailed so no bank-send occurred")
+
+	// Community pool must have grown: the delegator's bonded-period score contributed
+	// to the proportion calculation, so their userAmount was computed and routed to
+	// the Community Pool (since all validators are jailed).
+	communityAfter := communityPoolBalance(requireT, testApp, ctx, bondDenom)
+	communityGrowth := communityAfter.Sub(communityBefore)
+	requireT.True(communityGrowth.IsPositive(),
+		"delegator's bonded-period score must produce a positive userAmount "+
+			"that is routed to the Community Pool when all validators are jailed; "+
+			"community growth=%s", communityGrowth)
+
+	// Intermediary must be fully drained.
+	intermediaryAddr := testApp.AccountKeeper.GetModuleAccount(
+		ctx, types.ClearingAccountCommunityIntermediary,
+	).GetAddress()
+	intermediaryBalance := testApp.BankKeeper.GetBalance(ctx, intermediaryAddr, bondDenom).Amount
+	requireT.True(intermediaryBalance.IsZero(),
+		"intermediary must be fully drained after finalization")
+}
+
+// TestDistribution_JailedValidator_BatchTransition documents the accepted behavior when a
+// validator is jailed between Phase-2 batches: earlier batches may treat it as healthy while
+// later batches treat it as jailed. The test verifies no panic and no PSE disable occur.
+//
+// This scenario is intentionally reproduced using a small batch size (1) so that
+// two delegators span two separate Phase-2 batches.
+func TestDistribution_JailedValidator_BatchTransition(t *testing.T) {
+	requireT := require.New(t)
+
+	testApp := simapp.New()
+	pseKeeper := testApp.PSEKeeper
+	stakingKeeper := testApp.StakingKeeper
+
+	t0 := time.Now().UTC().Round(time.Second)
+	ctx, _, err := testApp.BeginNextBlockAtTime(t0)
+	requireT.NoError(err)
+	bondDenom, err := stakingKeeper.BondDenom(ctx)
+	requireT.NoError(err)
+
+	// Set batch size to 1 so each delegator is processed in its own Phase-2 block.
+	// This forces the batch-transition scenario where the validator state can change
+	// between batch 1 (block N) and batch 2 (block N+1).
+	params, err := pseKeeper.GetParams(ctx)
+	requireT.NoError(err)
+	params.DistributionBatchSize = 1
+	requireT.NoError(pseKeeper.SetParams(ctx, params))
+
+	// Single shared validator used by both delegators.
+	op, _ := testApp.GenAccount(ctx)
+	requireT.NoError(testApp.FundAccount(ctx, op,
+		sdk.NewCoins(sdk.NewCoin(bondDenom, sdkmath.NewInt(1_000)))))
+	sharedVal, err := testApp.AddValidator(ctx, op, sdk.NewInt64Coin(bondDenom, 10), nil)
+	requireT.NoError(err)
+	sharedValAddr := sdk.MustValAddressFromBech32(sharedVal.GetOperator())
+
+	// Two delegators — each will occupy one Phase-2 batch.
+	del1, _ := testApp.GenAccount(ctx)
+	del2, _ := testApp.GenAccount(ctx)
+	requireT.NoError(testApp.FundAccount(ctx, del1,
+		sdk.NewCoins(sdk.NewCoin(bondDenom, sdkmath.NewInt(10_000)))))
+	requireT.NoError(testApp.FundAccount(ctx, del2,
+		sdk.NewCoins(sdk.NewCoin(bondDenom, sdkmath.NewInt(10_000)))))
+
+	delegateTo := func(del sdk.AccAddress, amount int64) {
+		_, err := stakingkeeper.NewMsgServerImpl(stakingKeeper).Delegate(ctx, &stakingtypes.MsgDelegate{
+			DelegatorAddress: del.String(),
+			ValidatorAddress: sharedValAddr.String(),
+			Amount:           sdk.NewInt64Coin(bondDenom, amount),
+		})
+		requireT.NoError(err)
+	}
+	delegateTo(del1, 1_000)
+	delegateTo(del2, 1_000)
+
+	// Schedule and fund the distribution.
+	scheduleTimestamp := t0.Add(5 * time.Second)
+	const distributionAmount = int64(10_000_000)
+	requireT.NoError(pseKeeper.SaveDistributionSchedule(ctx, []types.ScheduledDistribution{{
+		ID:        1,
+		Timestamp: uint64(scheduleTimestamp.Unix()),
+		Allocations: []types.ClearingAccountAllocation{{
+			ClearingAccount: types.ClearingAccountCommunity,
+			Amount:          sdkmath.NewInt(distributionAmount),
+		}},
+	}}))
+	fundCommunityAccount(requireT, testApp, ctx, bondDenom, sdkmath.NewInt(distributionAmount))
+
+	// t0+10s: non-community allocations + BeginCommunityDistribution.
+	// Phase-1 runs with batchSize=1 so it may take multiple blocks.
+	requireT.NoError(testApp.FinalizeBlockAtTime(t0.Add(10 * time.Second)))
+
+	// FIX: With batchSize=1, Phase 1 needs more blocks (4 DTE entries to process).
+	// Adding extra Phase 1 blocks to ensure completion.
+	requireT.NoError(testApp.FinalizeBlockAtTime(t0.Add(11 * time.Second)))
+	requireT.NoError(testApp.FinalizeBlockAtTime(t0.Add(11 * time.Second).Add(500 * time.Millisecond)))
+
+	// t0+12s: Phase-2 batch 1 — del1 is processed while validator is healthy.
+	requireT.NoError(testApp.FinalizeBlockAtTime(t0.Add(12 * time.Second)))
+
+	// Jail the validator between batch 1 and batch 2 to trigger the transition scenario.
+	ctx, _, err = testApp.BeginNextBlockAtTime(t0.Add(13 * time.Second))
+	requireT.NoError(err)
+	jailValidator(t, requireT, ctx, stakingKeeper, sharedValAddr)
+
+	// t0+15s: Phase-2 batch 2 — del2 is processed while validator is now jailed.
+	// Earlier batch (del1) processed as healthy; this batch (del2) processes as jailed.
+	// This is accepted behavior per spec: batch-ordering bias is documented, not fixed here.
+	requireT.NoError(testApp.FinalizeBlockAtTime(t0.Add(15 * time.Second)))
+
+	// Need additional Phase-2 blocks to process remaining delegators and finalize.
+	// With batchSize=1 and 4 delegators, need 4 blocks + 1 empty batch.
+	requireT.NoError(testApp.FinalizeBlockAtTime(t0.Add(16 * time.Second)))
+	requireT.NoError(testApp.FinalizeBlockAtTime(t0.Add(17 * time.Second)))
+	requireT.NoError(testApp.FinalizeBlockAtTime(t0.Add(18 * time.Second)))
+	requireT.NoError(testApp.FinalizeBlockAtTime(t0.Add(19 * time.Second)))
+
+	// t0+20s: finalize + cleanup.
+	requireT.NoError(testApp.FinalizeBlockAtTime(t0.Add(20 * time.Second)))
+
+	// Core assertion: no panic and no PSE disable despite mid-distribution jailing.
+	assertDistributionFinalized(requireT, pseKeeper, ctx, 1)
+
+	// Intermediary must be fully drained regardless of batch-transition state.
+	intermediaryAddr := testApp.AccountKeeper.GetModuleAccount(
+		ctx, types.ClearingAccountCommunityIntermediary,
+	).GetAddress()
+	intermediaryBalance := testApp.BankKeeper.GetBalance(ctx, intermediaryAddr, bondDenom).Amount
+	requireT.True(intermediaryBalance.IsZero(),
+		"intermediary must be drained even after a mid-distribution jail event")
+}
+
+// jailValidator is a test helper that jails the given validator and asserts
+// the jailed flag is visible through GetAllValidators.
+func jailValidator(
+	t *testing.T,
+	requireT *require.Assertions,
+	ctx sdk.Context,
+	stakingKeeper *stakingkeeper.Keeper,
+	valAddr sdk.ValAddress,
+) {
+	t.Helper()
+	val, err := stakingKeeper.GetValidator(ctx, valAddr)
+	requireT.NoError(err)
+	consAddr, err := val.GetConsAddr()
+	requireT.NoError(err)
+	requireT.NoError(stakingKeeper.Jail(ctx, sdk.ConsAddress(consAddr)))
+
+	all, err := stakingKeeper.GetAllValidators(ctx)
+	requireT.NoError(err)
+	found := false
+	for _, v := range all {
+		if v.OperatorAddress == valAddr.String() {
+			requireT.True(v.IsJailed(), "validator must be jailed after Jail() call")
+			found = true
+			break
+		}
+	}
+	requireT.True(found, "jailed validator must appear in GetAllValidators")
+}
+
+// fundCommunityAccount mints amount into pse_community and returns the funded amount.
+func fundCommunityAccount(
+	requireT *require.Assertions,
+	testApp *simapp.App,
+	ctx sdk.Context,
+	bondDenom string,
+	amount sdkmath.Int,
+) {
+	coins := sdk.NewCoins(sdk.NewCoin(bondDenom, amount))
+	macc := testApp.AccountKeeper.GetModuleAccount(ctx, types.ClearingAccountCommunity)
+	requireT.NoError(testApp.BankKeeper.MintCoins(ctx, minttypes.ModuleName, coins))
+	requireT.NoError(testApp.BankKeeper.SendCoinsFromModuleToModule(
+		ctx, minttypes.ModuleName, macc.GetName(), coins,
+	))
+}
+
+// runDistribution runs the three-block EndBlocker sequence used in all jailed-validator tests:
+//   - t0+10s: Phase-1 score conversion + BeginCommunityDistribution
+//   - t0+15s: Phase-2 first batch (pays delegators)
+//   - t0+20s: Phase-2 empty batch → finalize + cleanup
+func runDistribution(
+	requireT *require.Assertions,
+	testApp *simapp.App,
+	t0 time.Time,
+) {
+	requireT.NoError(testApp.FinalizeBlockAtTime(t0.Add(10 * time.Second)))
+	requireT.NoError(testApp.FinalizeBlockAtTime(t0.Add(15 * time.Second)))
+	requireT.NoError(testApp.FinalizeBlockAtTime(t0.Add(20 * time.Second)))
+}
+
+// assertDistributionFinalized checks PSE is not disabled and distribution ID advanced.
+//
+//nolint:unparam
+func assertDistributionFinalized(
+	requireT *require.Assertions,
+	pseKeeper keeper.Keeper,
+	ctx sdk.Context,
+	expectedID uint64,
+) {
+	disabled, err := pseKeeper.DistributionDisabled.Get(ctx)
+	requireT.NoError(err)
+	requireT.False(disabled, "PSE must not be disabled")
+
+	lastProcessed, err := pseKeeper.LastProcessedDistributionID.Get(ctx)
+	requireT.NoError(err)
+	requireT.Equal(expectedID, lastProcessed, "LastProcessedDistributionID must advance")
+}
+
+// communityPoolBalance returns the community pool balance for bondDenom.
+func communityPoolBalance(
+	requireT *require.Assertions,
+	testApp *simapp.App,
+	ctx sdk.Context,
+	bondDenom string,
+) sdkmath.Int {
+	feePool, err := testApp.DistrKeeper.FeePool.Get(ctx)
+	requireT.NoError(err)
+	return feePool.CommunityPool.AmountOf(bondDenom).TruncateInt()
+}

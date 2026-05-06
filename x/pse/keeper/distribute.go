@@ -249,7 +249,7 @@ func (k Keeper) ProcessOngoingTokenDistribution(
 			DelegatorAddress: item.delAddr.String(),
 			Score:            item.score,
 			TotalPseScore:    totalScore,
-			Amount:           userAmount,
+			Amount:           distributedAmount,
 			ScheduledAt:      ongoing.Timestamp,
 			DistributionId:   ongoingID,
 		}); err != nil {
@@ -357,6 +357,7 @@ func (k Keeper) addToDistributedAmount(ctx context.Context, distributionID uint6
 	return k.DistributedAmount.Set(ctx, distributionID, current.Add(amount))
 }
 
+//nolint:funlen
 func (k Keeper) distributeToDelegator(
 	ctx context.Context, delAddr sdk.AccAddress, amount sdkmath.Int, bondDenom string,
 ) (sdkmath.Int, error) {
@@ -375,38 +376,27 @@ func (k Keeper) distributeToDelegator(
 		return sdkmath.NewInt(0), errorsmod.Wrapf(err,
 			"query delegations: delegator=%s", delAddrBech32)
 	}
-	var delegations []stakingtypes.DelegationResponse
+
 	totalDelegationAmount := sdkmath.NewInt(0)
 	for _, delegation := range delegationResponse.DelegationResponses {
-		delegations = append(delegations, delegation)
 		totalDelegationAmount = totalDelegationAmount.Add(delegation.Balance.Amount)
 	}
 
 	// Only distribute to users with active stakes. If not, it will be leftover.
-	if len(delegations) == 0 || totalDelegationAmount.IsZero() {
+	if totalDelegationAmount.IsZero() {
 		return sdkmath.NewInt(0), nil
 	}
 
-	if err = k.bankKeeper.SendCoinsFromModuleToAccount(
-		ctx,
-		types.ClearingAccountCommunityIntermediary,
-		delAddr,
-		sdk.NewCoins(sdk.NewCoin(bondDenom, amount)),
-	); err != nil {
-		return sdkmath.NewInt(0), errorsmod.Wrapf(err,
-			"send reward from intermediary: delegator=%s amount=%s%s",
-			delAddrBech32, amount, bondDenom)
+	type eligibleDelegationEntry struct {
+		delegation stakingtypes.DelegationResponse
+		val        stakingtypes.Validator
+		valAddr    sdk.ValAddress
 	}
 
-	for _, delegation := range delegations {
-		// Skip fully-slashed validators (Balance=0) and auto-delegate only to healthy ones.
-		// Otherwise SDK Delegate returns ErrDelegatorShareExRateInvalid and disables PSE.
-		if delegation.Balance.Amount.IsZero() {
-			continue
-		}
-		// NOTE: this division will have rounding errors up to 1 subunit, which is acceptable and will be ignored.
-		// if that one subunit exists, it will remain in user balance as undelegated.
-		delegationAmount := delegation.Balance.Amount.Mul(amount).Quo(totalDelegationAmount)
+	var eligibleDelegations []eligibleDelegationEntry
+	eligibleDelegationAmount := sdkmath.NewInt(0)
+
+	for _, delegation := range delegationResponse.DelegationResponses {
 		valAddr, err := k.valAddressCodec.StringToBytes(delegation.Delegation.ValidatorAddress)
 		if err != nil {
 			return sdkmath.NewInt(0), errorsmod.Wrapf(err,
@@ -421,14 +411,70 @@ func (k Keeper) distributeToDelegator(
 				delAddrBech32, delegation.Delegation.ValidatorAddress)
 		}
 
-		_, err = k.stakingKeeper.Delegate(ctx, delAddr, delegationAmount, stakingtypes.Unbonded, val, true)
+		if val.Jailed {
+			// Jailed: ineligible for this distribution cycle.
+			// Score kept; delegator participates in future distributions.
+			continue
+		}
+
+		if delegation.Balance.Amount.IsZero() {
+			// Skip fully-slashed validators (Balance=0) and auto-delegate only to healthy ones.
+			// Otherwise SDK Delegate returns ErrDelegatorShareExRateInvalid and disables PSE.
+			continue
+		}
+
+		eligibleDelegations = append(eligibleDelegations, eligibleDelegationEntry{
+			delegation: delegation,
+			val:        val,
+			valAddr:    valAddr,
+		})
+		eligibleDelegationAmount = eligibleDelegationAmount.Add(delegation.Balance.Amount)
+	}
+
+	// Only eligibleShare is sent to the delegator and auto-delegated.
+	if eligibleDelegationAmount.IsZero() {
+		// All validators are jailed/slashed/inaccessible: bank-send is exactly
+		// zero; full amount remains in intermediary => Community Pool.
+		return sdkmath.NewInt(0), nil
+	}
+
+	eligibleShare := amount.Mul(eligibleDelegationAmount).Quo(totalDelegationAmount)
+	if eligibleShare.IsZero() {
+		return sdkmath.NewInt(0), nil
+	}
+
+	if err = k.bankKeeper.SendCoinsFromModuleToAccount(
+		ctx,
+		types.ClearingAccountCommunityIntermediary,
+		delAddr,
+		sdk.NewCoins(sdk.NewCoin(bondDenom, eligibleShare)),
+	); err != nil {
+		return sdkmath.NewInt(0), errorsmod.Wrapf(err,
+			"send reward from intermediary: delegator=%s amount=%s%s",
+			delAddrBech32, amount, bondDenom)
+	}
+
+	// Auto-delegate eligibleShare proportionally across eligible validators only.
+	for _, eligibleDelegation := range eligibleDelegations {
+		if eligibleDelegation.delegation.Balance.Amount.IsZero() {
+			continue
+		}
+		// NOTE: this division will have rounding errors up to 1 subunit, which is acceptable and will be ignored.
+		// if that one subunit exists, it will remain in user balance as undelegated.
+		delegationAmount := eligibleDelegation.delegation.Balance.Amount.Mul(eligibleShare).Quo(eligibleDelegationAmount)
+		if delegationAmount.IsZero() {
+			continue
+		}
+
+		_, err = k.stakingKeeper.Delegate(ctx, delAddr, delegationAmount, stakingtypes.Unbonded, eligibleDelegation.val, true)
 		if err != nil {
 			return sdkmath.NewInt(0), errorsmod.Wrapf(err,
 				"auto-delegate: delegator=%s validator=%s amount=%s%s",
-				delAddrBech32, delegation.Delegation.ValidatorAddress, delegationAmount, bondDenom)
+				delAddrBech32, eligibleDelegation.delegation.Delegation.ValidatorAddress, delegationAmount, bondDenom)
 		}
 	}
-	return amount, nil
+
+	return eligibleShare, nil
 }
 
 // batchSizeFromParams returns the configured batch size, falling back to the default
